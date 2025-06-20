@@ -1,0 +1,155 @@
+import os
+import pandas as pd
+from databricks import sql
+import json
+from crewai import Agent, Task, Crew, Process
+
+class DatabricksSchemaTool:
+    def __init__(self):
+        self.name = "DatabricksSchemaTool"
+        self.description = "Fetches table metadata from Databricks Unity Catalog"
+        self.func = self.fetch_schema
+
+    def fetch_schema(self, catalog: str, schema: str) -> str:
+        """
+        Fetches table structure from Databricks metastore
+        """
+        try:
+            with sql.connect(
+                server_hostname=os.getenv("DATABRICKS_HOST"),
+                http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+                access_token=os.getenv("DATABRICKS_TOKEN")) as conn:
+                
+                cursor = conn.cursor()
+                
+                # Get tables
+                cursor.execute(f"SHOW TABLES IN {catalog}.{schema}")
+                tables = [row.tableName for row in cursor.fetchall()]
+                
+                schema_info = {}
+                for table in tables:
+                    # Get columns
+                    cursor.execute(f"DESCRIBE TABLE {catalog}.{schema}.{table}")
+                    columns = [row.col_name for row in cursor.fetchall() 
+                              if row.col_name != '' and not row.col_name.startswith('#')]
+                    schema_info[table] = columns
+                
+                return json.dumps(schema_info, indent=4)
+        except Exception as e:
+            return f"Schema fetch error: {str(e)}"
+
+class DatabricksQueryTool:
+    def __init__(self):
+        self.name = "DatabricksQueryTool"
+        self.description = "Executes SQL queries on Databricks SQL Warehouse"
+        self.func = self.execute_query
+
+    def execute_query(self, query: str) -> str:
+        """
+        Executes Spark SQL query on Databricks
+        """
+        try:
+            with sql.connect(
+                server_hostname=os.getenv("DATABRICKS_HOST"),
+                http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+                access_token=os.getenv("DATABRICKS_TOKEN")) as conn:
+                
+                cursor = conn.cursor()
+                cursor.execute(query)
+                
+                # Convert Arrow table to JSON
+                result = cursor.fetchall_arrow().to_pandas().to_dict(orient="records")
+                return json.dumps(result, indent=4)
+        except Exception as e:
+            return f"Query execution error: {str(e)}"
+
+# Configure environment variables
+os.environ.update({
+    "DATABRICKS_HOST": "<your-workspace-url>",
+    "DATABRICKS_HTTP_PATH": "<sql-warehouse-http-path>",
+    "DATABRICKS_TOKEN": "<personal-access-token>"
+})
+
+# Instantiate tools
+schema_tool = DatabricksSchemaTool()
+query_tool = DatabricksQueryTool()
+
+# Agents (modified for Databricks context)
+profiling_agent = Agent(
+    role="Databricks Data Profiler",
+    goal="Generate Spark SQL for data quality checks",
+    tools=[schema_tool],
+    model="gpt4",
+    verbose=True,
+    backstory="Expert in Databricks SQL and data quality analysis"
+)
+
+execution_agent = Agent(
+    role="Query Execution Engine",
+    goal="Execute Spark SQL on Databricks",
+    tools=[query_tool],
+    model="gpt4",
+    verbose=True
+)
+
+presentation_agent = Agent(
+    role="Databricks Report Generator",
+    goal="Create comprehensive data quality reports",
+    model="gpt4",
+    verbose=True
+)
+
+# Updated Tasks with Databricks-specific checks
+profiling_task = Task(
+    description=f"""Generate Spark SQL queries for:
+    1. Table-level statistics using ANALYZE TABLE
+    2. Column-level NULL ratios
+    3. Data distribution analysis
+    4. Schema validation
+    5. Data freshness checks""",
+    expected_output="Spark SQL scripts for data profiling",
+    agent=profiling_agent,
+    output_file="databricks_profile.sql"
+)
+
+execution_task = Task(
+    description="Execute generated SQL using Databricks SQL Warehouse",
+    agent=execution_agent,
+    output_file="query_results.json"
+)
+
+presentation_task = Task(
+    description="Create Databricks Notebook-style report with:\n"
+                "- Summary statistics\n"
+                "- Data quality issues\n"
+                "- Visualizations recommendations\n"
+                "- Optimization suggestions",
+    agent=presentation_agent,
+    output_file="databricks_report.md"
+)
+
+# Crew setup remains similar
+data_crew = Crew(
+    agents=[profiling_agent, execution_agent, presentation_agent],
+    tasks=[profiling_task, execution_task, presentation_task],
+    process=Process.sequential,
+    verbose=2
+)
+
+# Main execution
+if __name__ == "__main__":
+    # For data loading (alternative to SQLite import)
+    # Use Databricks SDK or %fs magic commands in notebooks
+    # Example using Spark:
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+    df = spark.read.csv("/FileStore/tables/hr_data.csv", header=True)
+    df.write.saveAsTable("hr_data", mode="overwrite")
+    
+    # Execute crew
+    results = data_crew.kickoff(inputs={
+        "catalog": "hive_metastore",
+        "schema": "default"
+    })
+    
+    print(json.dumps(results, indent=4))
