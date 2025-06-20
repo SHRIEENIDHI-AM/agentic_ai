@@ -1,0 +1,141 @@
+import os
+import pandas as pd
+import psycopg2
+import json
+from langchain.agents import Tool, initialize_agent
+from langchain.chat_models import ChatOpenAI
+
+class PostgreSQLSchemaTool:
+    def __init__(self):
+        self.name = "PostgreSQLSchemaTool"
+        self.description = "Fetches table names and column names from PostgreSQL database."
+        self.func = self.fetch_schema
+
+    def fetch_schema(self, db_url: str) -> str:
+        """
+        Fetches the schema from PostgreSQL database
+        """
+        try:
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
+            
+            # Get tables
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """)
+            tables = [row[0] for row in cursor.fetchall()]
+
+            schema = {}
+            for table in tables:
+                # Get columns
+                cursor.execute(f"""
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table}'
+                """)
+                schema[table] = [row[0] for row in cursor.fetchall()]
+
+            conn.close()
+            return json.dumps(schema, indent=4)
+        except Exception as e:
+            return f"Error fetching schema: {str(e)}"
+
+
+class PostgreSQLQueryTool:
+    def __init__(self):
+        self.name = "PostgreSQLQueryTool"
+        self.description = "Executes SQL queries on PostgreSQL database."
+        self.func = self.execute_query
+
+    def execute_query(self, db_url: str, query: str) -> str:
+        """
+        Executes query on PostgreSQL database
+        """
+        print(f"Running query: {query}")
+        try:
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
+            cursor.execute(query)
+            
+            if cursor.description:  # For SELECT queries
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                result = [dict(zip(columns, row)) for row in rows]
+            else:  # For INSERT/UPDATE/DELETE
+                conn.commit()
+                result = {"status": "success", "rows_affected": cursor.rowcount}
+
+            conn.close()
+            return json.dumps(result, indent=4)
+        except Exception as e:
+            return f"Error executing query: {str(e)}"
+
+
+# Initialize tools
+schema_tool = PostgreSQLSchemaTool()
+query_tool = PostgreSQLQueryTool()
+
+# Create LangChain tools
+tools = [
+    Tool(
+        name="FetchSchema",
+        func=schema_tool.fetch_schema,
+        description="Fetches database schema (tables and columns)"
+    ),
+    Tool(
+        name="ExecuteQuery",
+        func=query_tool.execute_query,
+        description="Executes SQL queries on the database"
+    )
+]
+
+# Initialize LLM and agent
+llm = ChatOpenAI(model_name="gpt-4", temperature=0)
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent="structured-chat-zero-shot-react-description",
+    verbose=True
+)
+
+# Database configuration
+DB_URL = "postgresql://username:password@localhost:5432/database_name"
+
+# CSV to PostgreSQL loader (alternative to SQLite function)
+def load_csv_to_postgres(csv_path: str, table_name: str):
+    """
+    Load CSV data into PostgreSQL table
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        engine = create_engine(DB_URL)
+        df.to_sql(table_name, engine, if_exists='replace', index=False)
+        return f"Successfully loaded {len(df)} records into {table_name}"
+    except Exception as e:
+        return f"Error loading data: {str(e)}"
+
+
+if __name__ == "__main__":
+    # Example workflow
+    # 1. Load initial data (uncomment if needed)
+    # load_csv_to_postgres("dataset.csv", "hr_data")
+    
+    # 2. Profile database
+    profiling_result = agent.run(
+        f"Fetch schema from database at {DB_URL} and generate profiling queries"
+    )
+    
+    # 3. Execute profiling queries
+    execution_result = agent.run(
+        "Execute these profiling queries on the database: " + profiling_result
+    )
+    
+    # 4. Generate report
+    report = agent.run(
+        "Format these query results as a markdown report: " + execution_result
+    )
+    
+    print("Final Report:")
+    print(report)
