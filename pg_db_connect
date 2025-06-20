@@ -1,0 +1,197 @@
+import os
+import pandas as pd
+import psycopg2
+import json
+from crewai import Agent, Task, Crew, Process
+from urllib.parse import quote  # For secure URL formatting
+
+
+# ---------------------
+# PostgreSQL Tools
+# ---------------------
+class PostgreSQLSchemaTool:
+    def __init__(self):
+        self.name = "PostgreSQLSchemaTool"
+        self.description = "Fetches table names and column names from a PostgreSQL database."
+        self.func = self.fetch_schema
+
+    def fetch_schema(self, db_url: str) -> str:
+        try:
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
+
+            # Fetch tables
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
+            """)
+            tables = [row[0] for row in cursor.fetchall()]
+
+            schema = {}
+            for table in tables:
+                # Fetch column names
+                cursor.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns
+                    WHERE table_name = %s AND table_schema = 'public'
+                    ORDER BY ordinal_position;
+                """, (table,))
+                columns = [row[0] for row in cursor.fetchall()]
+                schema[table] = columns
+
+            conn.close()
+            return json.dumps(schema, indent=4)
+        except Exception as e:
+            return f"Error fetching schema: {str(e)}"
+
+
+class PostgreSQLQueryTool:
+    def __init__(self):
+        self.name = "PostgreSQLQueryTool"
+        self.description = "Executes SQL queries on a PostgreSQL database. Provide `db_url` and `query`."
+        self.func = self.execute_query
+
+    def execute_query(self, db_url: str, query: str) -> str:
+        try:
+            conn = psycopg2.connect(db_url)
+            cursor = conn.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            conn.close()
+            result = [dict(zip(columns, row)) for row in rows]
+            return json.dumps(result, indent=4)
+        except Exception as e:
+            return f"Error executing query: {str(e)}"
+
+
+# ---------------------
+# Data Migration Helper
+# ---------------------
+def create_postgres_db(csv_path: str, db_url: str):
+    from sqlalchemy import create_engine
+    engine = create_engine(db_url)
+    df = pd.read_csv(csv_path)
+    df.to_sql("hr_data", engine, if_exists="replace", index=False)
+
+
+# ---------------------
+# Configuration
+# ---------------------
+# Set environment variables for API keys and database credentials
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["POSTGRES_URL"] = "postgresql://username:password@localhost:5432/mydatabase"
+
+
+# ---------------------
+# Initialize Tools
+# ---------------------
+schema_tool_instance = PostgreSQLSchemaTool()
+query_tool_instance = PostgreSQLQueryTool()
+
+
+# ---------------------
+# Agents
+# ---------------------
+profiling_agent = Agent(
+    role="Data Profiling Agent",
+    goal="Generate PostgreSQL-compatible SQL queries for profiling and data quality checks.",
+    model="GPT-4",
+    verbose=True,
+    memory=True,
+    tools=[schema_tool_instance],
+    backstory="An expert in crafting insightful SQL queries for data analysis."
+)
+
+execution_agent = Agent(
+    role="SQL Query Executor",
+    goal="Execute SQL queries and return results.",
+    model="GPT-4",
+    verbose=True,
+    memory=True,
+    tools=[query_tool_instance]
+)
+
+presentation_agent = Agent(
+    role="Markdown Presenter",
+    goal="Present data findings in a well-structured Markdown format.",
+    model="GPT-4",
+    verbose=True,
+    memory=True,
+    backstory="An experienced Markdown formatter who knows how to turn query outcomes into beautiful reports."
+)
+
+
+# ---------------------
+# Tasks
+# ---------------------
+profiling_task = Task(
+    description=(  
+        "Use the `PostgreSQLSchemaTool` to fetch metadata and generate queries based on the PostgreSQL database structure. "
+        "Generate queries to profile data:\n"
+        "1. Count the number of records per table (e.g., SELECT COUNT(*) FROM table_name;).\n"
+        "2. Perform column-level analysis (unique counts, distinct values, averages, string min/max length)."
+    ),
+    expected_output="SQLite-to-PostgreSQL-compatible profiling queries",
+    agent=profiling_agent,
+    output_file="profile.yaml"
+)
+
+data_quality_task = Task(
+    description=(  
+        "Generate queries to identify data quality issues:\n"
+        "1. Identify missing values: SELECT COUNT(*) FROM table WHERE column_name IS NULL;\n"
+        "2. Find duplicates using combinations of columns.\n"
+        "3. Detect outliers using standard deviation or IQR methods on numeric columns."
+    ),
+    expected_output="PostgreSQL data quality queries",
+    agent=profiling_agent,
+    output_file="dq.yaml"
+)
+
+execution_task = Task(
+    description="Execute SQL queries using the `PostgreSQLQueryTool` with correct `db_url` and `query`.",
+    expected_output="Query execution results in structured form",
+    agent=execution_agent,
+    output_file="results.yaml"
+)
+
+presentation_task = Task(
+    description="Format query results into a Markdown report, focusing on:\n"
+                "1. Table of key metrics from profiling task.\n"
+                "2. Data quality issues identified in the second task.",
+    expected_output="Markdown report summarizing key outcomes",
+    agent=presentation_agent,
+    output_file="report.md"
+)
+
+
+# ---------------------
+# Execution Logic
+# ---------------------
+crew = Crew(
+    agents=[profiling_agent, execution_agent, presentation_agent],
+    tasks=[profiling_task, execution_task, presentation_task],
+    process=Process.sequential,
+    verbose=True
+)
+
+
+# ---------------------
+# Main Execution Flow
+# ---------------------
+if __name__ == "__main__":
+    # Path to your CSV and target PostgreSQL URL
+    csv_file = "dataset.csv"
+    db_url = os.getenv("POSTGRES_URL")
+
+    # Uncomment to populate PostgreSQL with sample data
+    # create_postgres_db(csv_file, db_url)
+
+    # Run the workflow
+    inputs = {"db_url": db_url}
+    result = crew.kickoff(inputs=inputs)
+
+    # Print or handle results
+    print(json.dumps(result, indent=4)) 	
