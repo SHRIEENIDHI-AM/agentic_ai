@@ -1,0 +1,95 @@
+pip install databricks-sql-connector
+
+os.environ["DATABRICKS_SERVER_HOSTNAME"] = "your-databricks-host"
+os.environ["DATABRICKS_HTTP_PATH"] = "your-http-path"
+os.environ["DATABRICKS_TOKEN"] = "your-personal-access-token"
+
+
+import os
+import json
+import pandas as pd
+from databricks import sql
+from crewai import Agent, Task, Crew, Process
+
+
+class DatabricksSchemaTool:
+    def __init__(self):
+        self.name = "DatabricksSchemaTool"
+        self.description = "Fetches table names and column names from Databricks."
+        self.func = self.fetch_schema
+
+    def fetch_schema(self):
+        """Fetch schema (tables and columns) from Databricks."""
+        try:
+            with sql.connect(
+                server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
+                http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+                access_token=os.getenv("DATABRICKS_TOKEN")
+            ) as connection:
+                cursor = connection.cursor()
+                # Fetch all tables in the default schema
+                cursor.execute("SHOW TABLES IN default")
+                tables = [row[1] for row in cursor.fetchall()]
+                schema = {}
+                for table in tables:
+                    cursor.execute(f"DESCRIBE TABLE default.{table}")
+                    columns = [row[0] for row in cursor.fetchall()]  # Column names
+                    schema[table] = columns
+                cursor.close()
+                return json.dumps(schema, indent=4)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+
+class DatabricksQueryTool:
+    def __init__(self):
+        self.name = "DatabricksQueryTool"
+        self.description = "Executes SQL queries on Databricks tables."
+        self.func = self.execute_query
+
+    def execute_query(self, table_name: str, query: str):
+        """Execute SQL query on a Databricks table."""
+        try:
+            with sql.connect(
+                server_hostname=os.getenv("DATABRICKS_SERVER_HOST NAME"),
+                http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+                access_token=os.getenv("DATABRICKS_TOKEN")
+            ) as connection:
+                cursor = connection.cursor()
+                cursor.execute(query)
+                results = cursor.fetchall()
+                cursor.close()
+                return json.dumps([dict(zip(cursor.keys(), row)) for row in results], indent=4)
+        except Exception as e:
+            return f"Query Error: {str(e)}"
+
+
+# Databricks-Specific Tasks
+profiling_task = Task(
+    description=(
+        "Use `SHOW TABLES` and `DESCRIBE TABLE` to fetch schema from Databricks. "
+        "Generate SQL queries for data profiling (counts, stats, quality checks)."
+    ),
+    expected_output="List of profiling SQL queries",
+    agent=Agent(role="Schema Profiler", model="gpt4", tools=[DatabricksSchemaTool()]),
+    output_file="databricks_profile.yaml"
+)
+
+execution_task = Task(
+    description="Execute profiling queries via Databricks SQL Connector.",
+    expected_output="Query results in Databricks-compatible JSON format.",
+    agent=Agent(role="Query Executor", model="gpt4", tools=[DatabricksQueryTool()]),
+    output_file="databricks_results.json"
+)
+
+# Main Crew
+crew = Crew(
+    agents=[Agent(role="Databricks Data Analyst", model="gpt4")],
+    tasks=[profiling_task, execution_task],
+    process=Process.sequential
+)
+
+# Run the Databricks workflow
+if __name__ == "__main__":
+    results = crew.kickoff({})
+    print(json.dumps(results, indent=4))
