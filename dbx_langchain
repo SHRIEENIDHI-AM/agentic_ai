@@ -1,0 +1,226 @@
+from databricks import sql
+from langchain.tools import tool
+import os
+import json
+from typing import Optional
+from pydantic import BaseModel
+
+
+class DatabricksConfig(BaseModel):
+    server_hostname: str
+    http_path: str
+    access_token: str
+    catalog: Optional[str] = None
+    schema: Optional[str] = None
+
+
+class DatabricksQueryExecutor:
+    def __init__(self, config: DatabricksConfig):
+        self.config = config
+
+    @tool("execute_databricks_query")
+    def execute_query(self, query: str) -> str:
+        """
+        Executes SQL query on Databricks and returns results as JSON.
+        Handles both read (SELECT) and write (INSERT/UPDATE/DELETE) operations.
+        For schema-specific queries, include the catalog and schema names in the query.
+        Example: SELECT * FROM catalog.schema.table
+        """
+        print(f"Executing Databricks query: {query}")
+        
+        connection_params = {
+            "server_hostname": self.config.server_hostname,
+            "http_path": self.config.http_path,
+            "access_token": self.config.access_token
+        }
+
+        try:
+            with sql.connect(**connection_params) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(query)
+                    
+                    if cursor.description:  # SELECT queries
+                        columns = [desc[0] for desc in cursor.description]
+                        rows = cursor.fetchall()
+                        result = {
+                            "status": "success",
+                            "data": [dict(zip(columns, row)) for row in rows],
+                            "count": len(rows)
+                        }
+                    else:  # DML operations
+                        result = {
+                            "status": "success",
+                            "rows_affected": cursor.rowcount
+                        }
+                        
+                    return json.dumps(result, indent=4)
+                    
+        except Exception as e:
+            error_result = {
+                "status": "error",
+                "message": str(e),
+                "query": query
+            }
+            return json.dumps(error_result, indent=4)
+
+from langchain.agents import AgentExecutor, Tool
+from langchain.agents import create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate
+
+# Initialize the executor
+db_executor = DatabricksQueryExecutor(config)
+
+# Create LangChain Tool
+db_tool = Tool.from_function(
+    func=db_executor.execute_query,
+    name="databricks_sql",
+    description="Execute SQL queries on Databricks. Input should be a valid SQL query."
+)
+
+# Create agent with this tool
+agent = create_tool_calling_agent(
+    llm=your_llm_instance,
+    tools=[db_tool],
+    prompt=ChatPromptTemplate.from_messages([...])
+)
+
+agent_executor = AgentExecutor(agent=agent, tools=[db_tool])
+# Example usage
+if __name__ == "__main__":
+    # Load configuration from environment variables
+    config = DatabricksConfig(
+        server_hostname=os.getenv("DATABRICKS_HOST"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_TOKEN"),
+        catalog="hive_metastore",  # Default catalog
+        schema="default"          # Default schema
+    )
+    
+    query_executor = DatabricksQueryExecutor(config)
+    
+    # Example query execution
+    test_query = "SELECT * FROM samples.tpch.customer LIMIT 5"
+    print(query_executor.execute_query(test_query))
+
+
+
+#################2
+from databricks import sql
+from langchain.tools import tool
+from langchain_community.agent_toolkits import create_sql_agent
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.utilities.sql_database import SQLDatabase
+import os
+import json
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+class DatabricksConfig(BaseModel):
+    """Configuration model for Databricks connection"""
+    server_hostname: str = Field(..., description="Databricks workspace URL")
+    http_path: str = Field(..., description="Warehouse HTTP path")
+    access_token: str = Field(..., description="Personal access token")
+    catalog: Optional[str] = Field("hive_metastore", description="Catalog name")
+    schema: Optional[str] = Field("default", description="Schema name")
+
+
+class DatabricksSQLTool:
+    def __init__(self, config: DatabricksConfig):
+        """Initialize with Databricks configuration"""
+        self.config = config
+        self.connection_params = {
+            "server_hostname": config.server_hostname,
+            "http_path": config.http_path,
+            "access_token": config.access_token,
+            "catalog": config.catalog,
+            "schema": config.schema
+        }
+
+    @tool("execute_databricks_query")
+    def execute_query(self, query: str) -> str:
+        """
+        Executes SQL query on Databricks and returns JSON formatted results.
+        Handles both read operations (SELECT) and write operations (INSERT/UPDATE/DELETE).
+        Always uses the configured catalog and schema unless overridden in the query.
+        """
+        print(f"Executing Databricks query: {query}")
+        
+        try:
+            with sql.connect(**self.connection_params) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(query)
+                    
+                    if cursor.description:  # SELECT queries
+                        columns = [desc[0] for desc in cursor.description]
+                        rows = cursor.fetchall()
+                        result = {
+                            "status": "success",
+                            "data": [dict(zip(columns, row)) for row in rows],
+                            "row_count": len(rows)
+                        }
+                    else:  # DML operations
+                        result = {
+                            "status": "success",
+                            "rows_affected": cursor.rowcount
+                        }
+                    
+                    return json.dumps(result, indent=2)
+        
+        except Exception as e:
+            error_result = {
+                "status": "error",
+                "message": str(e),
+                "query": query
+            }
+            return json.dumps(error_result, indent=2)
+
+
+def create_databricks_agent(llm, config: DatabricksConfig):
+    """Create a LangChain SQL agent configured for Databricks"""
+    db_tool = DatabricksSQLTool(config)
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """
+        You are a Databricks SQL expert. When answering:
+        1. Always use schema: {catalog}.{schema} unless specified otherwise
+        2. Format queries for Databricks SQL
+        3. Explain your reasoning"""),
+        ("user", "{input}")
+    ])
+    
+    tools = [db_tool.execute_query]
+    
+    agent = create_sql_agent(
+        llm=llm,
+        tools=tools,
+        prompt=prompt,
+        agent_type="openai-tools",
+        verbose=True
+    )
+    return agent
+
+
+# Example usage
+if __name__ == "__main__":
+    # Configuration
+    config = DatabricksConfig(
+        server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
+        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
+        access_token=os.getenv("DATABRICKS_ACCESS_TOKEN"),
+        catalog="analytics",
+        schema="prod"
+    )
+    
+    # Initialize components
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(model="gpt-4")
+    agent = create_databricks_agent(llm, config)
+    
+    # Example query execution
+    result = agent.invoke({
+        "input": "Find the top 5 customers by total purchase amount",
+        "catalog": config.catalog,
+        "schema": config.schema
+    })
+    print(result)
